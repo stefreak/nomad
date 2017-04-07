@@ -388,10 +388,12 @@ func (c *ServiceClient) UpdateTask(allocID string, existing, newTask *structs.Ta
 	existingIDs := make(map[string]*structs.Service, len(existing.Services))
 	for _, s := range existing.Services {
 		existingIDs[makeTaskServiceID(allocID, existing.Name, s)] = s
+		c.logger.Printf("[XXX] EXISTING: %s", makeTaskServiceID(allocID, existing.Name, s))
 	}
 	newIDs := make(map[string]*structs.Service, len(newTask.Services))
-	for _, s := range existing.Services {
+	for _, s := range newTask.Services {
 		newIDs[makeTaskServiceID(allocID, newTask.Name, s)] = s
+		c.logger.Printf("[XXX] UPDATED : %s", makeTaskServiceID(allocID, newTask.Name, s))
 	}
 
 	parseAddr := newTask.FindHostAndPortFor
@@ -409,48 +411,37 @@ func (c *ServiceClient) UpdateTask(allocID string, existing, newTask *structs.Ta
 			continue
 		}
 
-		// Service hasn't changed; diff checks
-		delete(newIDs, existingID)
-
-		existingChks := make(map[string]struct{}, len(existingSvc.Checks))
-		for _, c := range existingSvc.Checks {
-			existingChks[createCheckID(existingID, c)] = mark
-		}
-		newChks := make(map[string]*structs.ServiceCheck, len(newSvc.Checks))
-		for _, c := range newSvc.Checks {
-			newChks[createCheckID(existingID, c)] = c
-		}
-
-		for existingChkID := range existingChks {
-			_, ok := newChks[existingChkID]
-			if !ok {
-				// Existing check removed
-				ops.deregChecks[existingChkID] = mark
-				continue
-			}
-			// Checks match, don't reregister
-			delete(newChks, existingChkID)
+		// Manipulating checks is cheap and easy, so just remove old and add new
+		for _, check := range existingSvc.Checks {
+			ops.deregChecks[createCheckID(existingID, check)] = mark
 		}
 
 		// Register new checks
-		for id, check := range newChks {
+		for _, check := range newSvc.Checks {
+			checkID := createCheckID(existingID, check)
+			// Don't deregister this check if it hasn't changed
+			delete(ops.deregChecks, checkID)
 			if check.Type == structs.ServiceCheckScript {
 				if exec == nil {
 					return fmt.Errorf("driver doesn't support script checks")
 				}
-				ops.regScripts[id] = newScriptCheck(
-					id, check, exec, c.client, c.logger, c.shutdownCh)
+				ops.regScripts[checkID] = newScriptCheck(
+					checkID, check, exec, c.client, c.logger, c.shutdownCh)
 			}
 			host, port := parseAddr(existingSvc.PortLabel)
 			if check.PortLabel != "" {
 				host, port = parseAddr(check.PortLabel)
 			}
-			checkReg, err := createCheckReg(existingID, id, check, host, port)
+			checkReg, err := createCheckReg(existingID, checkID, check, host, port)
 			if err != nil {
 				return err
 			}
-			ops.regChecks[id] = checkReg
+			ops.regChecks[checkID] = checkReg
 		}
+
+		// Service hasn't changed and checks are updated so don't
+		// process this service again later
+		delete(newIDs, existingID)
 	}
 
 	// Any remaining services should just be enqueued directly
