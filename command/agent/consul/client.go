@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/hashicorp/consul/api"
@@ -62,11 +61,21 @@ type CatalogAPI interface {
 
 // AgentAPI is the consul/api.Agent API used by Nomad.
 type AgentAPI interface {
+	Services() (map[string]*api.AgentService, error)
 	CheckRegister(check *api.AgentCheckRegistration) error
 	CheckDeregister(checkID string) error
 	ServiceRegister(service *api.AgentServiceRegistration) error
 	ServiceDeregister(serviceID string) error
 	UpdateTTL(id, output, status string) error
+}
+
+type operations struct {
+	regServices []*api.AgentServiceRegistration
+	regChecks   []*api.AgentCheckRegistration
+	scripts     []*scriptCheck
+
+	rmServices []string
+	rmChecks   []string
 }
 
 // ServiceClient handles task and agent service registration with Consul.
@@ -85,43 +94,27 @@ type ServiceClient struct {
 	// sync() to finish. Defaults to defaultShutdownWait
 	shutdownWait time.Duration
 
-	// syncCh triggers a sync in the main Run loop
-	syncCh chan struct{}
+	opCh chan *operations
 
-	// pending service and check operations
-	pending *consulOps
-	opsLock sync.Mutex
-
-	// script check cancel funcs to be called before their corresponding
-	// check is removed. Only accessed in sync() so not covered by regLock
-	runningScripts map[string]*scriptHandle
-
-	// regLock must be held while accessing reg and dereg maps
-	regLock sync.Mutex
-
-	// Registered agent services and checks
-	agentServices map[string]struct{}
-	agentChecks   map[string]struct{}
-
-	// agentLock must be held while accessing agent maps
-	agentLock sync.Mutex
+	services map[string]*api.AgentServiceRegistration
+	checks   map[string]*api.AgentCheckRegistration
+	scripts  map[string]*scriptCheck
 }
 
 // NewServiceClient creates a new Consul ServiceClient from an existing Consul API
 // Client and logger.
 func NewServiceClient(consulClient AgentAPI, logger *log.Logger) *ServiceClient {
 	return &ServiceClient{
-		client:         consulClient,
-		logger:         logger,
-		retryInterval:  defaultSyncInterval,
-		runningCh:      make(chan struct{}),
-		shutdownCh:     make(chan struct{}),
-		shutdownWait:   defaultShutdownWait,
-		syncCh:         make(chan struct{}, 1),
-		pending:        newConsulOps(),
-		runningScripts: make(map[string]*scriptHandle),
-		agentServices:  make(map[string]struct{}, 8),
-		agentChecks:    make(map[string]struct{}, 8),
+		client:        consulClient,
+		logger:        logger,
+		retryInterval: defaultSyncInterval,
+		runningCh:     make(chan struct{}),
+		shutdownCh:    make(chan struct{}),
+		shutdownWait:  defaultShutdownWait,
+		regs:          make(chan *registrations, 8),
+		services:      make(map[string]*api.AgentServiceRegistration),
+		checks:        make(map[string]*api.AgentCheckRegistration),
+		scriptChecks:  make(map[string]*scriptCheck),
 	}
 }
 
@@ -129,18 +122,11 @@ func NewServiceClient(consulClient AgentAPI, logger *log.Logger) *ServiceClient 
 // be called exactly once.
 func (c *ServiceClient) Run() {
 	defer close(c.runningCh)
-	timer := time.NewTimer(0)
-	defer timer.Stop()
-
-	// Drain the initial tick so we don't sync until instructed
-	<-timer.C
-
 	lastOk := true
 	for {
 		select {
-		case <-c.syncCh:
-			timer.Reset(0)
-		case <-timer.C:
+		case <-c.regs:
+			c.merge(regs)
 			if err := c.sync(); err != nil {
 				if lastOk {
 					lastOk = false
@@ -159,17 +145,78 @@ func (c *ServiceClient) Run() {
 	}
 }
 
-// forceSync asynchronously causes a sync to happen. Any operations enqueued
-// prior to calling forceSync will be synced.
-func (c *ServiceClient) forceSync() {
+// register registations asynchronously or do nothing if shutting down.
+func (c *ServiceClient) register(r *registrations) {
 	select {
-	case c.syncCh <- mark:
-	default:
+	case c.regs <- r:
+	case <-c.shutdownCh:
 	}
 }
 
+//FIXME move into a syncer struct owned by Run
+// Merge registrations into state map prior to sync'ing with Consul
+func (c *ServiceClient) merge(r *operations) {
+	for _, s := range r.regServices {
+		c.services[s.ID] = s
+	}
+	for _, check := range r.regChecks {
+		c.services[check.ID] = check
+	}
+	for _, s := range r.scripts {
+		c.scripts[s.id] = s
+	}
+	for _, sid := range r.rmServices {
+		delete(c.services, sid)
+	}
+	for _, cid := range r.rmChecks {
+		if script, ok := c.scripts; ok {
+			script.cancel()
+			delete(c.scripts, cid)
+		}
+		delete(c.checks, cid)
+	}
+}
+
+//FIXME move into a syncer struct owned by Run
 // sync enqueued operations.
 func (c *ServiceClient) sync() error {
+	consulServices, err := c.client.Services()
+	if err != nil {
+		return fmt.Errorf("error querying Consul services: %v", err)
+	}
+
+	sreg, creg, sdereg, cdereg := 0, 0, 0, 0
+
+	// Remove Nomad services in Consul but unknown locally
+	for id := range consulServices {
+		if _, ok := c.services[id]; ok {
+			// Known service, skip
+			continue
+		}
+		if !isNomadService(id) {
+			// Not managed by Nomad, skip
+			continue
+		}
+		// Unknown Nomad managed service! Kill
+		if err := c.client.ServiceDeregister(id); err != nil {
+			return err
+		}
+		sdereg++
+	}
+
+	// Add Nomad services missing from Consul
+	for id, service := range c.services {
+		if _, ok := consulServices[id]; ok {
+			// Already in Consul; skipping
+			continue
+		}
+		//TODO Register service
+		sreg++
+	}
+
+	//TODO Checks
+
+	//FIXME OLD REMOVE
 	c.opsLock.Lock()
 	ops := c.pending
 	c.pending = newConsulOps()
@@ -620,4 +667,10 @@ func createCheckReg(serviceID, checkID string, check *structs.ServiceCheck, host
 		return nil, fmt.Errorf("check type %+q not valid", check.Type)
 	}
 	return &chkReg, nil
+}
+
+// isNomadService returns true if the ID matches the pattern of a Nomad managed
+// service.
+func isNomadService(id string) bool {
+	return strings.HasPrefix(id, nomadServicePrefix)
 }
