@@ -1415,9 +1415,6 @@ func (r *TaskRunner) handleUpdate(update *structs.Allocation) error {
 		r.restartTracker.SetPolicy(tg.RestartPolicy)
 	}
 
-	// Deregister the old service+checks
-	r.consul.RemoveTask(r.alloc.ID, r.task)
-
 	// Store the updated alloc.
 	r.alloc = update
 	r.task = updatedTask
